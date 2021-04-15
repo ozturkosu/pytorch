@@ -1,4 +1,5 @@
 #include <torch/csrc/jit/passes/onnx/preprocess_for_onnx.h>
+
 #include <torch/csrc/jit/jit_log.h>
 #include <torch/csrc/jit/passes/onnx/helper.h>
 
@@ -72,7 +73,7 @@ void FuseWithListUnpack(Node* n) {
       Symbol::fromQualString("attr::_outputs"),
       static_cast<int64_t>(listUnpack_node->outputs().size()));
 
-  for (auto i = 0; i < listUnpack_node->outputs().size(); ++i) {
+  for (size_t i = 0; i < listUnpack_node->outputs().size(); ++i) {
     auto new_output = n->addOutput();
     new_output->copyMetadata(listUnpack_node->output(i));
   }
@@ -97,6 +98,7 @@ static void FuseWithListUnpack(Block* b) {
       case aten::unbind:
       case aten::unsafe_chunk:
       case aten::where:
+      case aten::nonzero_numpy:
         FuseWithListUnpack(*it);
         break;
       default:
@@ -142,7 +144,8 @@ static void ReplaceAddWithConcat(Block* b) {
         continue;
       }
 
-      TypePtr elem = it->input(0)->type()->cast<ListType>()->getElementType();
+      TypePtr elem =
+          it->input(0)->type()->castRaw<ListType>()->getElementType();
       if (elem->cast<IntType>()) {
         Node* concat_node = b->owningGraph()->create(onnx::Concat, 1);
         concat_node->i_(attr::axis, 0);
@@ -159,11 +162,67 @@ static void ReplaceAddWithConcat(Block* b) {
   }
 }
 
+// This pass also covers the case when the input to ListUnpack
+// is int[] comming from some other op than ListConstruct (like Slice or Shape)
+//
+// before the pass
+// graph(%x.1 : Float(2, 3, strides=[3, 1], requires_grad=0, device=cpu)):
+//   %1 : None = prim::Constant()
+//   %2 : int[] = aten::size(%x.1) # <string>:7:9
+//   %a.1 : int, %b.1 : int = prim::ListUnpack(%2)
+//   %5 : int[] = prim::ListConstruct(%a.1, %b.1)
+//   %6 : Tensor = aten::new_zeros(%x.1, %5, %1, %1, %1, %1) #
+//   test/onnx/test_pytorch_onnx_onnxruntime.py:1757:23 return (%6)
+//
+// after the pass:
+// graph(%x.1 : Float(2, 3, strides=[3, 1], requires_grad=0, device=cpu)):
+//   %1 : None = prim::Constant()
+//   %2 : int[] = aten::size(%x.1) # <string>:7:9
+//   %7 : Tensor = onnx::Constant[value={0}]()
+//   %8 : Tensor = onnx::Gather(%2, %7)
+//   %9 : Tensor = onnx::Constant[value={1}]()
+//   %10 : Tensor = onnx::Gather(%2, %9)
+//   %a.1 : int, %b.1 : int = prim::ListUnpack(%2)
+//   %5 : int[] = prim::ListConstruct(%8, %10)
+//   %6 : Tensor = aten::new_zeros(%x.1, %5, %1, %1, %1, %1) #
+//   test/onnx/test_pytorch_onnx_onnxruntime.py:1757:23 return (%6)
+static void fuseListAndListUnpack(Block* b) {
+  for (auto it = b->nodes().begin(), end = b->nodes().end(); it != end; ++it) {
+    for (auto* child_block : it->blocks()) {
+      fuseListAndListUnpack(child_block);
+    }
+    if (it->kind() == prim::ListUnpack) {
+      for (size_t i = 0; i < it->outputs().size(); i++) {
+        auto output = it->outputs().at(i);
+        if (it->inputs().size() == 1 &&
+            it->input()->node()->kind() != prim::ListConstruct &&
+            it->input()->type()->cast<ListType>() &&
+            it->input()
+                ->type()
+                ->castRaw<ListType>()
+                ->getElementType()
+                ->cast<IntType>()) {
+          Node* gather_indices = b->owningGraph()->create(onnx::Constant, 1);
+          gather_indices->insertBefore(*it);
+          gather_indices->t_(
+              attr::value, at::scalar_to_tensor(at::Scalar(int(i))));
+          Node* gather_node = b->owningGraph()->create(onnx::Gather, 1);
+          gather_node->insertBefore(*it);
+          gather_node->addInput(it->input());
+          gather_node->addInput(gather_indices->output());
+          output->replaceAllUsesWith(gather_node->output());
+        }
+      }
+    }
+  }
+}
+
 } // namespace
 
 void PreprocessForONNX(std::shared_ptr<Graph>& graph) {
   FuseWithListUnpack(graph->block());
   ReplaceAddWithConcat(graph->block());
+  fuseListAndListUnpack(graph->block());
 }
 
 } // namespace jit

@@ -4,6 +4,7 @@
 #include <c10/core/Backend.h>
 #include <c10/core/Layout.h>
 #include <c10/core/ScalarType.h>
+#include <c10/core/ScalarTypeToTypeMeta.h>
 #include <c10/core/Device.h>
 #include <c10/core/MemoryFormat.h>
 #include <c10/core/DispatchKeySet.h>
@@ -21,23 +22,23 @@ namespace c10 {
 DispatchKey computeDispatchKey(c10::optional<ScalarType> dtype, c10::optional<Layout> layout, c10::optional<Device> device);
 
 inline ScalarType dtype_or_default(c10::optional<ScalarType> dtype) {
-  return dtype.has_value() ? *dtype : get_default_dtype_as_scalartype();
+  return value_or_else(dtype, [] {return get_default_dtype_as_scalartype();});
 }
 
 inline caffe2::TypeMeta dtype_or_default(c10::optional<caffe2::TypeMeta> dtype) {
-  return dtype.has_value() ? *dtype : get_default_dtype();
+  return value_or_else(dtype, [] {return get_default_dtype();});
 }
 
 inline Layout layout_or_default(c10::optional<Layout> layout) {
-  return layout.has_value() ? *layout : kStrided;
+  return layout.value_or(kStrided);
 }
 
 inline Device device_or_default(c10::optional<Device> device) {
-  return device.has_value() ? *device : Device(kCPU);
+  return value_or_else(device, [] {return Device(kCPU);});
 }
 
 inline bool pinned_memory_or_default(c10::optional<bool> pinned_memory) {
-  return pinned_memory.has_value() ? *pinned_memory : false;
+  return pinned_memory.value_or(false);
 }
 
 /// A class to encapsulate construction axes of an Tensor.  TensorOptions was
@@ -119,6 +120,8 @@ inline bool pinned_memory_or_default(c10::optional<bool> pinned_memory) {
 ///
 /// To get around this, we templatize the `Device` constructor. Since overload
 /// resolution is done before template resolution, our problem is solved.
+
+DispatchKey computeDispatchKey(optional<ScalarType> dtype, optional<Layout> layout, optional<Device> device);
 
 
 struct C10_API TensorOptions {
@@ -334,9 +337,13 @@ struct C10_API TensorOptions {
     return layout_ == c10::Layout::Sparse;
   }
 
+  bool is_sparse_csr() const {
+    return layout_ == c10::Layout::SparseCsr;
+  }
+
   // For compatibility with legacy tensor.type() comparisons
   bool type_equal(const TensorOptions& other) const {
-    return backend() == other.backend() && typeMetaToScalarType(dtype_) == typeMetaToScalarType(other.dtype());
+    return computeDispatchKey() == other.computeDispatchKey() && typeMetaToScalarType(dtype_) == typeMetaToScalarType(other.dtype());
   }
 
   /// Returns the `pinned_memory` property of the `TensorOptions`, or
@@ -376,23 +383,31 @@ struct C10_API TensorOptions {
   /// device guard.
   ///
   TensorOptions merge_in(TensorOptions options) const noexcept {
-    TensorOptions r = options;
-    if (!r.has_device()) r.set_device(device_opt());
-    if (!r.has_dtype()) r.set_dtype(dtype_opt());
-    if (!r.has_layout()) r.set_layout(layout_opt());
+    TensorOptions merged = *this;
+    if (options.has_device()) merged.set_device(options.device_opt());
+    if (options.has_dtype()) merged.set_dtype(options.dtype_opt());
+    if (options.has_layout()) merged.set_layout(options.layout_opt());
     // NB: requires grad is right biased; not a logical AND/OR!
-    if (!r.has_requires_grad()) r.set_requires_grad(requires_grad_opt());
-    if (!r.has_pinned_memory()) r.set_pinned_memory(pinned_memory_opt());
-    if (!r.has_memory_format()) r.set_memory_format(memory_format_opt());
-    return r;
+    if (options.has_requires_grad()) merged.set_requires_grad(options.requires_grad_opt());
+    if (options.has_pinned_memory()) merged.set_pinned_memory(options.pinned_memory_opt());
+    if (options.has_memory_format()) merged.set_memory_format(options.memory_format_opt());
+    return merged;
   }
 
-  // Resolves the tensor type set specified by the current construction axes.
-  DispatchKeySet key_set() const noexcept {
-    return DispatchKeySet(computeDispatchKey());
+  // TODO remove after TensorOptions rationalization
+  TensorOptions merge_memory_format(c10::optional<MemoryFormat> optional_memory_format) const noexcept {
+    TensorOptions merged = *this;
+    if (optional_memory_format.has_value()) {
+      merged.set_memory_format(*optional_memory_format);
+    }
+    return merged;
   }
 
-  inline DispatchKey computeDispatchKey() const {
+  // INVARIANT: computeDispatchKey returns only the subset of dispatch keys for
+  // which dispatchKeyToBackend is injective, if it is defined at all  (for
+  // the most part, this just means that this function never returns an
+  // Autograd key)
+  DispatchKey computeDispatchKey() const {
     return c10::computeDispatchKey(optTypeMetaToScalarType(dtype_opt()), layout_opt(), device_opt());
   }
 
@@ -492,8 +507,8 @@ struct C10_API TensorOptions {
   // NB: We didn't use c10::optional here, because then we can't pack
   // the has_***_ boolean fields.
 
-  caffe2::TypeMeta dtype_ = caffe2::TypeMeta::Make<float>(); // 64-bit
-  Device device_ = at::kCPU; // 32-bit
+  Device device_ = at::kCPU; // 16-bit
+  caffe2::TypeMeta dtype_ = caffe2::TypeMeta::Make<float>(); // 16-bit
   Layout layout_ = at::kStrided; // 8-bit
   MemoryFormat memory_format_ = MemoryFormat::Contiguous; // 8-bit
 
@@ -595,6 +610,12 @@ inline DispatchKey computeDispatchKey(c10::optional<ScalarType> dtype, c10::opti
             }
             return DispatchKey::CUDA;
           }
+          case DeviceType::XPU: {
+            if (isQIntType(dtype_)) {
+              return DispatchKey::QuantizedXPU;
+            }
+            return DispatchKey::XPU;
+          }
           case DeviceType::MKLDNN:
             return DispatchKey::MKLDNN;
           case DeviceType::OPENGL:
@@ -611,10 +632,16 @@ inline DispatchKey computeDispatchKey(c10::optional<ScalarType> dtype, c10::opti
             return DispatchKey::MSNPU;
           case DeviceType::XLA:
             return DispatchKey::XLA;
+          case DeviceType::MLC:
+            return DispatchKey::MLC;
           case DeviceType::Vulkan:
             return DispatchKey::Vulkan;
+          case DeviceType::Metal:
+            return DispatchKey::Metal;
+          case DeviceType::Meta:
+            return DispatchKey::Meta;
           default:
-            AT_ERROR("Unsupported device type for dense layout: ", device_.type());
+            TORCH_CHECK_NOT_IMPLEMENTED(false, "Unsupported device type for dense layout: ", device_.type());
         }
       }
       case Layout::Sparse:
@@ -625,59 +652,103 @@ inline DispatchKey computeDispatchKey(c10::optional<ScalarType> dtype, c10::opti
             return DispatchKey::SparseCUDA;
           case DeviceType::HIP:
             return DispatchKey::SparseHIP;
+          case DeviceType::XPU:
+            return DispatchKey::SparseXPU;
           default:
-            AT_ERROR("Unsupported device type for sparse layout: ", device_.type());
+            TORCH_CHECK_NOT_IMPLEMENTED(false, "Unsupported device type for sparse layout: ", device_.type());
         }
       case Layout::Mkldnn:
         switch (device_.type()) {
           case DeviceType::CPU:
             return DispatchKey::MkldnnCPU;
           default:
-            AT_ERROR("Unsupported device type for mkldnn layout: ", device_.type());
+            TORCH_CHECK_NOT_IMPLEMENTED(false, "Unsupported device type for mkldnn layout: ", device_.type());
+        }
+      case Layout::SparseCsr:
+        switch(device_.type()) {
+          case DeviceType::CPU:
+            return DispatchKey::SparseCsrCPU;
+          case DeviceType::CUDA:
+            return DispatchKey::SparseCsrCUDA;
+          default:
+            AT_ERROR("Unsupported device type for sparse CSR layout: ", device_.type());
         }
       default:
-        AT_ERROR("Unsupported layout: ", layout_);
+        TORCH_CHECK(false, "Unsupported layout: ", layout_);
     }
 }
 
-// We deliberately ignore handling AutogradCPU/CUDA/XLA... keys to
-// avoid adding asymmetry in device <--> Autograd dispatch key mapping.
-inline DeviceType computeDeviceType(DispatchKey tid) {
-  if (tid == DispatchKey::CPU) {
-    return DeviceType::CPU;
-  } else if (tid == DispatchKey::CUDA) {
-    return DeviceType::CUDA;
-  } else if (tid == DispatchKey::HIP) {
-    return DeviceType::HIP;
-  } else if (tid == DispatchKey::FPGA) {
-    return DeviceType::FPGA;
-  } else if (tid == DispatchKey::MKLDNN) {
-    return DeviceType::MKLDNN;
-  } else if (tid == DispatchKey::OpenGL) {
-    return DeviceType::IDEEP;
-  } else if (tid == DispatchKey::OpenCL) {
-    return DeviceType::OPENCL;
-  } else if (tid == DispatchKey::IDEEP) {
-    return DeviceType::IDEEP;
-  } else if (tid == DispatchKey::HIP) {
-    return DeviceType::HIP;
-  } else if (tid == DispatchKey::MSNPU) {
-    return DeviceType::MSNPU;
-  } else if (tid == DispatchKey::XLA) {
-    return DeviceType::XLA;
-  } else if (tid == DispatchKey::SparseCPU) {
-    return DeviceType::CPU;
-  } else if (tid == DispatchKey::SparseCUDA) {
-    return DeviceType::CUDA;
-  } else if (tid == DispatchKey::SparseHIP) {
-    return DeviceType::HIP;
-  } else if (tid == DispatchKey::MkldnnCPU) {
-    return DeviceType::CPU;
-  } else if (tid == DispatchKey::Vulkan) {
-    return DeviceType::Vulkan;
-  } else {
-    AT_ASSERTM(false, "Unknown DispatchKey: ", tid);
+inline Layout dispatchKeyToLayout(DispatchKey dispatch_key) {
+  switch (dispatch_key) {
+    case DispatchKey::SparseCPU:
+    case DispatchKey::SparseCUDA:
+    case DispatchKey::SparseHIP:
+    case DispatchKey::SparseXPU:
+    case DispatchKey::SparseCsrCPU:
+    case DispatchKey::SparseCsrCUDA:
+      return Layout::Sparse;
+    case DispatchKey::MkldnnCPU:
+      return Layout::Mkldnn;
+    default:
+      return Layout::Strided;
   }
+}
+
+inline DeviceType dispatchKeyToDeviceType(DispatchKey dispatch_key) {
+  switch(dispatch_key) {
+    // stuff that's real
+    case DispatchKey::CPU:
+    case DispatchKey::SparseCPU:
+    case DispatchKey::MkldnnCPU:
+    case DispatchKey::QuantizedCPU:
+    case DispatchKey::AutogradCPU:
+      return DeviceType::CPU;
+    case DispatchKey::CUDA:
+    case DispatchKey::SparseCUDA:
+    case DispatchKey::QuantizedCUDA:
+    case DispatchKey::AutogradCUDA:
+      return DeviceType::CUDA;
+    case DispatchKey::HIP:
+    case DispatchKey::SparseHIP:
+      return DeviceType::HIP;
+    case DispatchKey::XLA:
+    case DispatchKey::AutogradXLA:
+      return DeviceType::XLA;
+    case DispatchKey::Vulkan:
+      return DeviceType::Vulkan;
+    case DispatchKey::Meta:
+      return DeviceType::Meta;
+
+    // stuff that people are actively developing
+    case DispatchKey::XPU:
+    case DispatchKey::SparseXPU:
+    case DispatchKey::QuantizedXPU:
+    case DispatchKey::AutogradXPU:
+      return DeviceType::XPU;
+    case DispatchKey::MLC:
+    case DispatchKey::AutogradMLC:
+      return DeviceType::MLC;
+
+    // stuff that isn't real
+    case DispatchKey::MKLDNN:
+      return DeviceType::MKLDNN;
+    case DispatchKey::OpenGL:
+      return DeviceType::IDEEP;
+    case DispatchKey::OpenCL:
+      return DeviceType::OPENCL;
+    case DispatchKey::IDEEP:
+      return DeviceType::IDEEP;
+    case DispatchKey::MSNPU:
+      return DeviceType::MSNPU;
+    default:
+      TORCH_CHECK(false, "DispatchKey ", dispatch_key, " doesn't correspond to a device");
+  }
+}
+
+inline TensorOptions dispatchKeyToTensorOptions(DispatchKey dispatch_key) {
+  return TensorOptions()
+          .layout(dispatchKeyToLayout(dispatch_key))
+          .device(dispatchKeyToDeviceType(dispatch_key));
 }
 
 } // namespace c10

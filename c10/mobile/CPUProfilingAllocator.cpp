@@ -1,38 +1,23 @@
 #include <climits>
 
 #include <c10/mobile/CPUProfilingAllocator.h>
+#include <c10/util/irange.h>
 
 namespace c10 {
 
 namespace {
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 thread_local AllocationPlanner* allocation_planner{nullptr};
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 thread_local CPUProfilingAllocator* profiling_allocator{nullptr};
 
 struct MemBlock {
   uint64_t start_offset, end_offset;
   MemBlock(uint64_t s, uint64_t e) : start_offset(s), end_offset(e) {}
   bool operator<(const MemBlock& other) const {
-    return end_offset <= other.start_offset;
+    return start_offset < other.start_offset;
   }
 };
-
-bool validate_allocation_plan(
-    const std::vector<uint64_t>& allocation_sizes,
-    const std::vector<uint64_t>& allocation_offsets) {
-  std::set<MemBlock> allocations;
-  for (uint64_t i = 0; i < allocation_sizes.size(); ++i) {
-    // Skip allocations not managed by AllocationPlan
-    if (allocation_offsets[i] == std::numeric_limits<uint64_t>::max()) {
-      continue;
-    }
-    auto start_offset = allocation_offsets[i];
-    auto end_offset = allocation_offsets[i] + allocation_sizes[i];
-    if (!allocations.emplace(start_offset, end_offset).second) {
-      return false;
-    }
-  }
-  return true;
-}
 
 enum class EventType {
   Allocate = 0,
@@ -48,6 +33,58 @@ struct MemEvent {
   MemEvent(uint64_t t, uint64_t id, uint64_t s, EventType e) :
     time(t), allocation_id(id), size(s), type(e) {}
 };
+
+bool overlaps(const MemBlock& a, const MemBlock& b) {
+  // two blocks dont overlap if
+  // |---a--------|--------------b--------|
+  // strat_a     end_a <= start_b       end_b
+  return
+    !((a.end_offset <= b.start_offset) || (b.end_offset <= a.start_offset));
+}
+
+bool validate_allocation_plan(
+    const std::vector<MemEvent>& alloc_events,
+    const std::vector<uint64_t>& allocation_offsets) {
+  std::set<MemBlock> allocations;
+  for (const auto& event : alloc_events) {
+    auto alloc_id = event.allocation_id;
+    // Skip allocations not managed by AllocationPlan
+    if (allocation_offsets[alloc_id] == std::numeric_limits<uint64_t>::max()) {
+      continue;
+    }
+    auto start_offset = allocation_offsets[alloc_id];
+    auto end_offset = allocation_offsets[alloc_id] + event.size;
+    MemBlock mem_block(start_offset, end_offset);
+    if (event.type == EventType::Allocate) {
+      auto it = allocations.lower_bound(mem_block);
+      if (it != allocations.end()) {
+        auto next_block = *it;
+        if (overlaps(next_block, mem_block)) {
+          return false;
+        }
+      }
+      if (it != allocations.begin()) {
+        auto prev_block = *(--it);
+        if (overlaps(prev_block, mem_block)) {
+          return false;
+        }
+      }
+      allocations.emplace(mem_block);
+    } else if (event.type == EventType::Free) {
+      auto it = allocations.find(mem_block);
+      TORCH_CHECK((*it).end_offset == end_offset,
+          "Enf offset of allocation being freed must match the one recorded.");
+      TORCH_CHECK(
+          it != allocations.end(),
+          "ProfilingAllocator: Allocate event "
+          "must have preceded deallocate event.");
+      allocations.erase(it);
+    } else {
+      TORCH_CHECK(false, "ProfilingAllocator: Invalid event type.");
+    }
+  }
+  return true;
+}
 
 std::vector<MemEvent> create_and_sort_mem_events(
     const std::vector<uint64_t>& allocation_sizes,
@@ -99,21 +136,22 @@ std::vector<uint64_t> formulate_greedy_allocation_plan(
   ska::flat_hash_map<uint64_t, std::map<uint64_t, uint64_t>::iterator> free_end_offset_to_size_iter;
   // Upon free end_ptr = offset + size
   // If end_ptr exists merge freed allocation
-  // Also find coresponding offset in size_to_offet
+  // Also find corresponding offset in size_to_offset
   // Remove that entry and update with new size and offset
   // If end_ptr does not exist then just insert offset,size
   // in map and correspondingly size, offset in the other map.
   // Merging should always be done recursively until no more chunks
   // that can be found.
   // After last free we should have only one entry left in these maps.
-  ska::flat_hash_map<uint64_t, uint64_t> allocated_offset_to_size;
 
   std::vector<uint64_t> allocation_offsets(
       allocation_sizes.size(), std::numeric_limits<uint64_t>::max());
   auto mem_events = create_and_sort_mem_events(allocation_sizes, allocation_lifetimes);
   uint64_t max_offset{0};
   for (const auto& mem_event : mem_events) {
+    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     uint64_t alloc_offset;
+    // NOLINTNEXTLINE(cppcoreguidelines-init-variables)
     uint64_t new_offset, new_size;
     if (mem_event.type == EventType::Allocate) {
       auto it = free_size_to_offset.lower_bound(mem_event.size);
@@ -122,7 +160,6 @@ std::vector<uint64_t> formulate_greedy_allocation_plan(
         // allocate a new one.
         alloc_offset = max_offset;
         max_offset += mem_event.size;
-        allocated_offset_to_size.emplace(alloc_offset, mem_event.size);
       } else {
         // If we have found a block of the size we want
         // 1. change the block by allocating out of it.
@@ -130,7 +167,6 @@ std::vector<uint64_t> formulate_greedy_allocation_plan(
         //    1.2 Erase the reverse map entries
         // 2. If block still has space left insert the remainder back in map.
         //    Including reverse map entries.
-        // 3. Insert the allocated block in allocated_offset_to_size.
         alloc_offset = it->second;
         new_offset = alloc_offset + mem_event.size;
         new_size = it->first - mem_event.size;
@@ -138,15 +174,14 @@ std::vector<uint64_t> formulate_greedy_allocation_plan(
         free_start_offset_to_size_iter.erase(alloc_offset);
         free_end_offset_to_size_iter.erase(alloc_offset + it->first);
         if (new_size > 0) {
-          auto ref_it = free_size_to_offset.emplace(new_offset, new_size).first;
+          auto ref_it = free_size_to_offset.emplace(new_size, new_offset).first;
           free_start_offset_to_size_iter.emplace(new_offset, ref_it);
           free_end_offset_to_size_iter.emplace(new_offset + new_size, ref_it);
         }
-        allocated_offset_to_size.emplace(alloc_offset, mem_event.size);
       }
       allocation_offsets[mem_event.allocation_id] = alloc_offset;
     } else {
-      // 1. Check if freed block is adjancent to an existing free block
+      // 1. Check if freed block is adjacent to an existing free block
       //    at its end boundary. This is done by checking
       //    free_end_offset_to_size_iter.
       //    If we find such a block, remove it and adjust size of
@@ -156,28 +191,35 @@ std::vector<uint64_t> formulate_greedy_allocation_plan(
       //    free_start_offset_to_size_iter.
       //    If we find such a block, remove it and adjust size of
       //    the block being freed.
-      // 3. Inser the freed block in map.
+      // 3. Insert the freed block in map.
       auto freed_offset = allocation_offsets[mem_event.allocation_id];
       auto freed_size = mem_event.size;
       auto end_offset = freed_offset + freed_size;
       // Merge when another free block exist at the end of this block
-      auto end_it = free_end_offset_to_size_iter.find(end_offset);
-      if (end_it != free_end_offset_to_size_iter.end()) {
-        auto size_to_end_offset_iter = end_it->second;
-        freed_size += size_to_end_offset_iter->first;
-        free_size_to_offset.erase(size_to_end_offset_iter);
-        free_end_offset_to_size_iter.erase(end_it);
+      auto end_it = free_start_offset_to_size_iter.find(end_offset);
+      if (end_it != free_start_offset_to_size_iter.end()) {
+        auto merge_block_iter = end_it->second;
+        auto merge_block_size = merge_block_iter->first;
+        freed_size += merge_block_size;
+        free_size_to_offset.erase(merge_block_iter);
+        free_start_offset_to_size_iter.erase(end_it);
+        // If the block is being merged then also remove it from
+        // free_end_offset_to_size_iter
+        free_end_offset_to_size_iter.erase(end_offset + merge_block_size);
       }
       // Merge when freed block exist at the end of another free block
-      auto start_it = free_start_offset_to_size_iter.find(freed_offset);
-      if (start_it != free_start_offset_to_size_iter.end()) {
-        auto size_to_start_offset_iter = start_it->second;
-        freed_size += size_to_start_offset_iter->first;
-        freed_offset -= size_to_start_offset_iter->first;
-        free_size_to_offset.erase(size_to_start_offset_iter);
-        free_start_offset_to_size_iter.erase(start_it);
+      auto start_it = free_end_offset_to_size_iter.find(freed_offset);
+      if (start_it != free_end_offset_to_size_iter.end()) {
+        auto merge_block_iter = start_it->second;
+        auto merge_block_size = merge_block_iter->first;
+        freed_size += merge_block_size;
+        freed_offset -= merge_block_size;
+        free_size_to_offset.erase(merge_block_iter);
+        free_end_offset_to_size_iter.erase(start_it);
+        // If the block is being merged then also remove it from
+        // free_start_offset_to_size_iter
+        free_start_offset_to_size_iter.erase(freed_offset);
       }
-      allocated_offset_to_size.erase(freed_offset);
       auto freed_block_it =
         free_size_to_offset.emplace(freed_size, freed_offset).first;
       free_start_offset_to_size_iter.emplace(freed_offset, freed_block_it);
@@ -185,8 +227,8 @@ std::vector<uint64_t> formulate_greedy_allocation_plan(
           freed_offset + freed_size, freed_block_it);
     }
   }
-  TORCH_CHECK(validate_allocation_plan(allocation_sizes, allocation_offsets),
-      "Allocation plan invaild.");
+  TORCH_CHECK(validate_allocation_plan(mem_events, allocation_offsets),
+      "ProfilingAllocator: Allocation plan invalid.");
   return allocation_offsets;
 }
 
@@ -207,7 +249,7 @@ void AllocationPlanner::record_allocation(
   allocation_plan_->allocation_sizes.push_back(size);
   allocation_plan_->allocation_lifetimes.push_back(
       std::numeric_limits<uint64_t>::max());
-  allocation_ptr_to_id_.emplace(ptr, allocation_id_);
+  allocation_ptr_to_id_[ptr] = allocation_id_;
   allocation_id_++;
 }
 
@@ -244,7 +286,7 @@ bool AllocationPlanner::validate_allocation(
 
     return false;
   }
-  allocation_ptr_to_id_.emplace(ptr, allocation_id_);
+  allocation_ptr_to_id_[ptr] =  allocation_id_;
   allocation_id_++;
   return true;
 }
@@ -267,7 +309,7 @@ void AllocationPlanner::formulate_plan() {
     formulate_greedy_allocation_plan(
         allocation_plan_->allocation_sizes, allocation_plan_->allocation_lifetimes);
   allocation_plan_->total_size = 0;
-  for (auto i = 0; i < allocation_plan_->allocation_sizes.size(); ++i) {
+  for (const auto i : c10::irange(allocation_plan_->allocation_sizes.size())) {
     if (allocation_plan_->allocation_lifetimes[i] ==
         std::numeric_limits<uint64_t>::max()) {
       continue;
@@ -313,7 +355,7 @@ void* CPUProfilingAllocator::allocate(const size_t bytes) {
   void* ptr =
     reinterpret_cast<uint8_t*>(blob_) +
     plan_->allocation_offsets[allocation_id_];
-  TORCH_CHECK(allocation_ptr_to_id_.emplace(ptr, allocation_id_).second);
+  allocation_ptr_to_id_[ptr] = allocation_id_;
   allocation_id_++;
   return ptr;
 }
@@ -357,7 +399,7 @@ CPUProfilingAllocator::~CPUProfilingAllocator() {
 
 WithProfileAllocationsGuard::WithProfileAllocationsGuard(
     AllocationPlan* plan) {
-  // Nesting of allocation profiling does not seem meanigful.
+  // Nesting of allocation profiling does not seem meaningful.
   TORCH_CHECK(allocation_planner == nullptr,
       "Nesting profiling allocations is not supported.");
   planner_ = std::make_unique<AllocationPlanner>(plan);
@@ -372,7 +414,7 @@ WithProfileAllocationsGuard::~WithProfileAllocationsGuard() {
 
 WithValidateAllocationPlanGuard::WithValidateAllocationPlanGuard(
     AllocationPlan* plan, bool* success) {
-  // Nesting of allocation profiling does not seem meanigful.
+  // Nesting of allocation profiling does not seem meaningful.
   TORCH_CHECK(allocation_planner == nullptr,
       "Nesting profiling allocations is not supported.");
   planner_ = std::make_unique<AllocationPlanner>(plan, true);

@@ -10,13 +10,13 @@
  //
  //===----------------------------------------------------------------------===//
 
- #ifndef LLVM_SUPPORT_MATHEXTRAS_H
- #define LLVM_SUPPORT_MATHEXTRAS_H
+ #pragma once
 
  #include <algorithm>
- #include <cmath>
  #include <cassert>
  #include <climits>
+ #include <cmath>
+ #include <cstdint>
  #include <cstring>
  #include <limits>
  #include <type_traits>
@@ -54,6 +54,7 @@
  }
  #endif
 
+ namespace c10 {
  namespace llvm {
  /// The behavior an operation has on an input of 0.
  enum ZeroBehavior {
@@ -547,26 +548,26 @@
  /// (32 bit edition.)
  /// Ex. Log2_32(32) == 5, Log2_32(1) == 0, Log2_32(0) == -1, Log2_32(6) == 2
  inline unsigned Log2_32(uint32_t Value) {
-   return 31 - countLeadingZeros(Value);
+   return static_cast<unsigned>(31 - countLeadingZeros(Value));
  }
 
  /// Return the floor log base 2 of the specified value, -1 if the value is zero.
  /// (64 bit edition.)
  inline unsigned Log2_64(uint64_t Value) {
-   return 63 - countLeadingZeros(Value);
+   return static_cast<unsigned>(63 - countLeadingZeros(Value));
  }
 
  /// Return the ceil log base 2 of the specified value, 32 if the value is zero.
  /// (32 bit edition).
  /// Ex. Log2_32_Ceil(32) == 5, Log2_32_Ceil(1) == 0, Log2_32_Ceil(6) == 3
  inline unsigned Log2_32_Ceil(uint32_t Value) {
-   return 32 - countLeadingZeros(Value - 1);
+   return static_cast<unsigned>(32 - countLeadingZeros(Value - 1));
  }
 
  /// Return the ceil log base 2 of the specified value, 64 if the value is zero.
  /// (64 bit edition.)
  inline unsigned Log2_64_Ceil(uint64_t Value) {
-   return 64 - countLeadingZeros(Value - 1);
+   return static_cast<unsigned>(64 - countLeadingZeros(Value - 1));
  }
 
  /// Return the greatest common divisor of the values using Euclid's algorithm.
@@ -589,6 +590,7 @@
 
  /// This function takes a 32-bit integer and returns the bit equivalent float.
  inline float BitsToFloat(uint32_t Bits) {
+   //TODO: Use bit_cast once C++20 becomes available.
    float F;
    static_assert(sizeof(uint32_t) == sizeof(float), "Unexpected type sizes");
    memcpy(&F, &Bits, sizeof(Bits));
@@ -860,5 +862,4 @@
  /// Use this rather than HUGE_VALF; the latter causes warnings on MSVC.
  extern const float huge_valf;
  } // End llvm namespace
-
- #endif
+ } // End c10 namespace

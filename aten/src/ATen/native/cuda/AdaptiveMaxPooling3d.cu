@@ -131,10 +131,10 @@ void adaptivemaxpool_loop(
     adaptivemaxpool<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       input_data, output_data, indices_data, isizeT, isizeH, isizeW,
       osizeT, osizeH, osizeW, istrideD, istrideT, istrideH, istrideW, offsetZ);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     totalZ -= 65535;
     offsetZ += 65535;
-    AT_CUDA_CHECK(cudaGetLastError());
   }
 }
 
@@ -209,10 +209,9 @@ void adaptivemaxgradinput_loop(
     adaptivemaxgradinput<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       gradInput_data, gradOutput_data, indices_data,
       isizeT, isizeH, isizeW, osizeT, osizeH, osizeW, offsetZ);
-
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     totalZ -= 65535;
     offsetZ += 65535;
-    AT_CUDA_CHECK(cudaGetLastError());
   }
 }
 
@@ -286,10 +285,9 @@ void atomicadaptivemaxgradinput_loop(
     atomicadaptivemaxgradinput<<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
       gradInput_data, gradOutput_data, indices_data,
       isizeT, isizeH, isizeW, osizeT, osizeH, osizeW, offsetZ);
-
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     totalZ -= 65535;
     offsetZ += 65535;
-    AT_CUDA_CHECK(cudaGetLastError());
   }
 }
 
@@ -462,11 +460,10 @@ void adaptive_max_pool3d_backward_out_cuda_template(
 
 } // namespace
 
-std::tuple<Tensor&, Tensor&> adaptive_max_pool3d_out_cuda(
+std::tuple<Tensor&, Tensor&> adaptive_max_pool3d_out_cuda(const Tensor& input,
+  IntArrayRef output_size,
   Tensor& output,
-  Tensor& indices,
-  const Tensor& input,
-  IntArrayRef output_size)
+  Tensor& indices)
 {
   adaptive_max_pool3d_out_cuda_template(
     output,
@@ -490,11 +487,10 @@ std::tuple<Tensor, Tensor> adaptive_max_pool3d_cuda(
   return std::tuple<Tensor, Tensor>(output, indices);
 }
 
-Tensor& adaptive_max_pool3d_backward_out_cuda(
-  Tensor& gradInput,
-  const Tensor& gradOutput_,
+Tensor& adaptive_max_pool3d_backward_out_cuda(const Tensor& gradOutput_,
   const Tensor& input,
-  const Tensor& indices)
+  const Tensor& indices,
+  Tensor& gradInput)
 {
   adaptive_max_pool3d_backward_out_cuda_template(
     gradInput,

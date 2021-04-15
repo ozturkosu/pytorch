@@ -251,10 +251,9 @@ void adaptive_max_pool2d_out_cuda_template(
                                     indices_data,
                                     isizeH, isizeW, osizeH, osizeW,
                                     istrideD, istrideH, istrideW);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
       }
     );
-    AT_CUDA_CHECK(cudaGetLastError());
-
   } else {
     Tensor input_ = input.contiguous();
     int64_t sizeB  = input_.size(0);
@@ -288,10 +287,9 @@ void adaptive_max_pool2d_out_cuda_template(
                                     indices_data,
                                     isizeH, isizeW, osizeH, osizeW,
                                     istrideD, istrideH, istrideW);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
       }
     );
-    AT_CUDA_CHECK(cudaGetLastError());
-
   }
 }
 
@@ -346,6 +344,7 @@ void adaptive_max_pool2d_backward_out_cuda_template(
                                               gradInput_data, gradOutput_data,
                                               indices_data,
                                               isizeH, isizeW, osizeH, osizeW);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
         else
         {
@@ -354,10 +353,10 @@ void adaptive_max_pool2d_backward_out_cuda_template(
                                               gradInput_data, gradOutput_data,
                                               indices_data,
                                               isizeH, isizeW, osizeH, osizeW);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
       }
     );
-    AT_CUDA_CHECK(cudaGetLastError());
   } else {
     int64_t sizeB  = input.size(0);
     int64_t sizeD  = input.size(1);
@@ -392,6 +391,7 @@ void adaptive_max_pool2d_backward_out_cuda_template(
                                               gradInput_data, gradOutput_data,
                                               indices_data,
                                               isizeH, isizeW, osizeH, osizeW);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
         else
         {
@@ -400,20 +400,19 @@ void adaptive_max_pool2d_backward_out_cuda_template(
                                               gradInput_data, gradOutput_data,
                                               indices_data,
                                               isizeH, isizeW, osizeH, osizeW);
+          C10_CUDA_KERNEL_LAUNCH_CHECK();
         }
       }
     );
-    AT_CUDA_CHECK(cudaGetLastError());
   }
 }
 
 } // namespace
 
-std::tuple<Tensor&, Tensor&> adaptive_max_pool2d_out_cuda(
+std::tuple<Tensor&, Tensor&> adaptive_max_pool2d_out_cuda(const Tensor& input,
+  IntArrayRef output_size,
   Tensor& output,
-  Tensor& indices,
-  const Tensor& input,
-  IntArrayRef output_size)
+  Tensor& indices)
 {
   adaptive_max_pool2d_out_cuda_template(
     output,
@@ -437,11 +436,10 @@ std::tuple<Tensor, Tensor> adaptive_max_pool2d_cuda(
   return std::tuple<Tensor, Tensor>(output, indices);
 }
 
-Tensor& adaptive_max_pool2d_backward_out_cuda(
-  Tensor& gradInput,
-  const Tensor& gradOutput_,
+Tensor& adaptive_max_pool2d_backward_out_cuda(const Tensor& gradOutput_,
   const Tensor& input,
-  const Tensor& indices)
+  const Tensor& indices,
+  Tensor& gradInput)
 {
   // See Note [Writing Nondeterministic Operations]
   // Nondeterministic because of atomicAdd usage

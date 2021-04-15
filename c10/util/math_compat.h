@@ -6,6 +6,7 @@
 // Various hacks in this header allow the rest of the codebase to use
 // standard APIs.
 #if defined(__ANDROID__) && __ANDROID_API__ < 21 && defined(__GLIBCXX__)
+#include <stdexcept>
 
 namespace std {
   // Import double versions of these functions from the global namespace.
@@ -60,13 +61,27 @@ namespace std {
   }
 
   // TODO: this function needs to be implemented and tested. Currently just throw an error.
+  inline float igamma(float x, float y) {
+    throw std::runtime_error("igamma is not implemented on older Android");
+  }
+  inline double igamma(double x, double y) {
+    throw std::runtime_error("igamma is not implemented on older Android");
+  }
+  inline float igammac(float x, float y) {
+    throw std::runtime_error("igammac is not implemented on older Android");
+  }
+  inline double igammac(double x, double y) {
+    throw std::runtime_error("igammac is not implemented on older Android");
+  }
+
+  // TODO: this function needs to be implemented and tested. Currently just throw an error.
   inline float nextafter(float x, float y) {
     throw std::runtime_error("std::nextafter is not implemented on older Android");
   }
   inline double nextafter(double x, double y) {
     throw std::runtime_error("std::nextafter is not implemented on older Android");
   }
-  
+
    // TODO: this function needs to be implemented and tested. Currently just throw an error.
   inline float exp2(float x) {
     throw std::runtime_error("std::exp2 is not implemented on older Android");
